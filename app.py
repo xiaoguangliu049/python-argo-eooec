@@ -12,6 +12,7 @@ import string
 import shutil
 import platform
 import signal
+import socket
 import threading
 import subprocess
 import datetime
@@ -314,6 +315,7 @@ def download_all_files():
     else:
         log('NEZHA variable is empty, skipping nezha-agent')
 
+    all_ok = True
     for item in downloads:
         downloaded = False
         for index, base_url in enumerate(base_urls):
@@ -325,6 +327,8 @@ def download_all_files():
                 log(f'Retrying {item["name"]} from backup source')
         if not downloaded:
             log_error(f'Error downloading {item["name"]}: all sources failed')
+            all_ok = False
+    return all_ok
 
 # =========================== 授权文件执行权限 ===========================
 def authorize_files(file_names):
@@ -397,9 +401,11 @@ uuid: {UUID}"""
 def generate_xray_config():
     config = {
         "log": {
-            "access": "/dev/null",
-            "error": "/dev/null",
-            "loglevel": "none"
+            # 日志写到文件而不是 /dev/null, 级别 warning: 出问题能在
+            # .cache/xray_error.log 里看到原因, 而不是静默失败
+            "access": str(FILE_PATH / "xray_access.log"),
+            "error": str(FILE_PATH / "xray_error.log"),
+            "loglevel": "warning"
         },
         "inbounds": [
             {
@@ -585,8 +591,10 @@ def exec_cmd(command):
 def download_files_and_run():
     architecture = get_system_architecture()
 
-    # 下载文件
-    download_all_files()
+    # 下载文件, 任一二进制下载失败就直接中止, 不再去启动不存在的文件
+    if not download_all_files():
+        log_error('Binary download failed, aborting startup: nodes will not work')
+        return False
 
     # 授权执行权限
     files_to_authorize = [web_name, bot_name]
@@ -622,8 +630,11 @@ def download_files_and_run():
     else:
         log('NEZHA variable is empty, skipping running')
 
-    # 运行 Xray
-    command = f'nohup {web_path} -c {config_path} >/dev/null 2>&1 &'
+    # 运行 Xray (启动失败的报错写到 xray_stdout.log, 不再丢进 /dev/null)
+    if not web_path.exists():
+        log_error(f'Xray binary missing: {web_path}, aborting startup')
+        return False
+    command = f'nohup {web_path} -c {config_path} > {FILE_PATH / "xray_stdout.log"} 2>&1 &'
     try:
         exec_cmd(command)
         log(f'{web_name} is running')
@@ -631,12 +642,12 @@ def download_files_and_run():
     except Exception as e:
         log_error(f'web running error: {e}')
 
-    # 运行 Cloudflared
+    # 运行 Cloudflared (三种方式都把日志写到 boot.log, 不再丢进 /dev/null)
     if bot_path.exists():
         if re.match(r'^[A-Z0-9a-z=]{120,250}$', ARGO_AUTH):
-            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token {ARGO_AUTH}"
+            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info run --token {ARGO_AUTH}"
         elif "TunnelSecret" in ARGO_AUTH:
-            args = f"tunnel --edge-ip-version auto --config {FILE_PATH / 'tunnel.yml'} run"
+            args = f"tunnel --edge-ip-version auto --config {FILE_PATH / 'tunnel.yml'} --logfile {boot_log_path} --loglevel info run"
         else:
             args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{ARGO_PORT}"
 
@@ -648,6 +659,70 @@ def download_files_and_run():
             log_error(f'Error executing command: {e}')
 
     time.sleep(5)
+    return True
+
+
+# =========================== 启动后自检 ===========================
+def check_health():
+    """启动后自检:确认二进制在、Xray 在 ARGO_PORT 上监听、进程还在.
+    只写日志,不退出进程——让问题在日志里可见,而不是静默失败."""
+    ok = True
+
+    # 1. 二进制文件在不在
+    for label, p in (('Xray', web_path), ('cloudflared', bot_path)):
+        if p.exists():
+            log(f'Health check: {label} binary exists: {p}')
+        else:
+            log_error(f'Health check FAILED: {label} binary missing: {p}')
+            ok = False
+
+    # 2. Xray 是不是在 ARGO_PORT 上监听(最多等 10 秒)
+    listening = False
+    for _ in range(5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(('127.0.0.1', ARGO_PORT))
+            s.close()
+            listening = True
+            break
+        except Exception:
+            time.sleep(2)
+    if listening:
+        log(f'Health check OK: something is listening on 127.0.0.1:{ARGO_PORT}')
+    else:
+        log_error(f'Health check FAILED: nothing listening on 127.0.0.1:{ARGO_PORT} after 10s, Xray may not have started (see xray_error.log)')
+        ok = False
+
+    # 3. 进程还在不在(扫 /proc, 不依赖 pgrep/ps)
+    running = {}
+    try:
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    cmdline = f.read().decode('utf-8', 'ignore')
+            except Exception:
+                continue
+            if web_name and web_name in cmdline:
+                running['Xray'] = True
+            if bot_name and bot_name in cmdline:
+                running['cloudflared'] = True
+    except Exception as e:
+        log_error(f'Health check: cannot scan /proc: {e}')
+    for label in ('Xray', 'cloudflared'):
+        if running.get(label):
+            log(f'Health check OK: {label} process is running')
+        else:
+            log_error(f'Health check FAILED: {label} process not found')
+            ok = False
+
+    if ok:
+        log('Health check passed')
+    else:
+        log_error('Health check FAILED: see xray_error.log and boot.log for details')
+    return ok
 
 # =========================== 提取隧道域名 ===========================
 def extract_domains():
@@ -936,18 +1011,22 @@ def start_server():
     # 6. 生成 Xray 配置
     generate_xray_config()
 
-    # 7. 下载并运行文件
-    download_files_and_run()
+    # 7. 下载并运行文件 (下载失败直接中止, 不再往下走)
+    if not download_files_and_run():
+        return
 
-    # 8. 提取隧道域名并生成节点
+    # 8. 启动后自检
+    check_health()
+
+    # 9. 提取隧道域名并生成节点
     extract_domains()
 
-    # 9. Telegram 推送 + 节点上传 + 自动保活
+    # 10. Telegram 推送 + 节点上传 + 自动保活
     send_telegram()
     upload_nodes()
     add_visit_task()
 
-    # 10. 90秒后清理文件
+    # 11. 90秒后清理文件
     clean_files()
 
 # =========================== 信号处理 ===========================
